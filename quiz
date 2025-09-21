@@ -1,0 +1,72 @@
+import os, json, boto3
+
+REGION = os.getenv("AWS_REGION", "us-east-1")
+MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0")
+bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+
+SYSTEM = (
+  "You are an ESL quiz generator for CEFR A1–B1 learners. "
+  "Create ONE multiple-choice question with 4 options. Keep it simple and practical. "
+  "Return ONLY compact JSON of shape: "
+  '{"question":"...", "options":["A","B","C","D"], "answer_index":0-3, "explanation":"..."} '
+  "Rules: Question must be clear; only ONE correct answer; explanation ≤20 words."
+)
+
+def call_llm(prompt: str) -> str:
+    body = {"prompt": prompt, "max_gen_len": 200, "temperature": 0.3}
+    r = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(body),
+    )
+    data = json.loads(r["body"].read())
+    return data.get("generation") or (data.get("outputs", [{}])[0].get("text",""))
+
+def lambda_handler(event, context):
+    try:
+        body = json.loads(event.get("body") or "{}")
+        # Optional inputs to steer the quiz a bit
+        topic = (body.get("topic") or "basic grammar: past tense").strip()
+        level = (body.get("level") or "A2").strip().upper()
+
+        prompt = (
+            f"{SYSTEM}\nLevel: {level}\nTopic: {topic}\n"
+            "Return JSON only. No extra words."
+        )
+        raw = call_llm(prompt).strip()
+        quiz = try_parse_json(raw)
+        if not quiz or not isinstance(quiz.get("options", []), list) or quiz.get("answer_index") is None:
+            # very safe fallback
+            quiz = {
+                "question": "Which is correct?",
+                "options": ["She go to school yesterday.", "She went to school yesterday.", "She goes yesterday.", "She is go yesterday."],
+                "answer_index": 1,
+                "explanation": "Past tense of 'go' is 'went'."
+            }
+
+        return resp(200, quiz)
+    except Exception as e:
+        return resp(500, {"error": str(e)})
+
+def try_parse_json(s: str):
+    try:
+        return json.loads(s)
+    except:
+        a, b = s.find("{"), s.rfind("}")
+        if a != -1 and b != -1:
+            try: return json.loads(s[a:b+1])
+            except: return None
+        return None
+
+def resp(code, obj):
+    return {
+        "statusCode": code,
+        "headers": {
+            "Content-Type":"application/json",
+            "Access-Control-Allow-Origin":"*",
+            "Access-Control-Allow-Headers":"Content-Type",
+            "Access-Control-Allow-Methods":"POST,OPTIONS"
+        },
+        "body": json.dumps(obj)
+    }
