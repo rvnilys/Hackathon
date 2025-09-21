@@ -1,0 +1,121 @@
+import os, json, boto3
+
+REGION = os.getenv("AWS_REGION", "us-east-1")
+MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0")
+bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+
+LANG_MAP = {"fr": ("French", "fr"), "ms": ("Malay", "ms")}
+
+SYSTEM_BASE = (
+  "You are a polite waiter for CEFR A1 learners.\n"
+  "Respond ONLY in the target language.\n"
+  "Return a single JSON object exactly like:\n"
+  '{ "lang":"<iso2>", "ai_reply":"...", "corrections":["..."], "better":"...", "tip":"..." }\n'
+  "Rules:\n"
+  "- ai_reply ≤ 20 words, simple vocabulary.\n"
+  "- corrections: short bullet points (use target language when possible).\n"
+  "- better: slightly more polite phrasing in target language.\n"
+  "- tip: VERY short cultural etiquette in ENGLISH.\n"
+  "- No text outside JSON.\n"
+)
+
+FEW_SHOT_FR = (
+  'TargetLangLabel: French\nTargetLangCode: fr\n'
+  'User: "Bonjour, je veux un café."\n'
+  'JSON:\n'
+  '{"lang":"fr","ai_reply":"Bonjour, vous désirez autre chose ?","corrections":["Dites ‘je voudrais’."],"better":"Je voudrais un café, s’il vous plaît.","tip":"In France, greet and say please when ordering."}\n'
+)
+
+FEW_SHOT_MS = (
+  'TargetLangLabel: Malay\nTargetLangCode: ms\n'
+  'User: "Bang, saya mahu nasi lemak."\n'
+  'JSON:\n'
+  '{"lang":"ms","ai_reply":"Baik, mahu minuman juga?","corrections":["Lebih sopan gunakan ‘saya ingin’."],"better":"Saya ingin nasi lemak, tolong.","tip":"In Malaysia, ‘tolong’ adds politeness."}\n'
+)
+
+def call_llm(prompt, temperature=0.2, max_tokens=220):
+    body = {"prompt": prompt, "max_gen_len": max_tokens, "temperature": temperature}
+    r = bedrock.invoke_model(
+        modelId=MODEL_ID, contentType="application/json",
+        accept="application/json", body=json.dumps(body)
+    )
+    data = json.loads(r["body"].read())
+    return data.get("generation") or (data.get("outputs", [{}])[0].get("text",""))
+
+def build_prompt(user, lang_code):
+    label, code = LANG_MAP.get(lang_code, ("French","fr"))
+    fewshot = FEW_SHOT_MS if code == "ms" else FEW_SHOT_FR
+    return (
+        SYSTEM_BASE + fewshot +
+        f"TargetLangLabel: {label}\nTargetLangCode: {code}\n"
+        "STRICT: The JSON field \"lang\" MUST equal TargetLangCode. "
+        "Write all non-English content in the target language.\n"
+        f'User: "{user}"\nReturn JSON only:\n'
+    )
+
+def try_json(s):
+    s = s.strip()
+    try: return json.loads(s)
+    except:
+        a, b = s.find("{"), s.rfind("}")
+        if a != -1 and b != -1:
+            try: return json.loads(s[a:b+1])
+            except: return None
+        return None
+
+def lambda_handler(event, context):
+    # CORS preflight
+    if event.get("httpMethod") == "OPTIONS":
+        return {"statusCode": 200, "headers": cors(), "body": "{}"}
+
+    body = {}
+    raw = event.get("body")
+    if isinstance(raw, str):
+        try: body = json.loads(raw)
+        except: body = {}
+    elif isinstance(raw, dict):
+        body = raw
+
+    user = (body.get("user") or "Bonjour.").strip()
+    lang = (body.get("lang") or "fr").strip().lower()
+    if lang not in LANG_MAP: lang = "fr"
+
+    # first try
+    prompt = build_prompt(user, lang)
+    raw_out = call_llm(prompt, temperature=0.2)
+    data = try_json(raw_out)
+
+    # retry once if wrong language
+    expected = LANG_MAP[lang][1]
+    if not data or data.get("lang") != expected:
+        strong = prompt + f'\nCRITICAL: Use "lang":"{expected}" and target language ONLY.'
+        raw_out = call_llm(strong, temperature=0.1)
+        data = try_json(raw_out)
+
+    # safe fallback
+    if not data:
+        data = {"lang": expected}
+        if lang == "ms":
+            data.update({"ai_reply":"Baik, mahu pesan apa lagi?","corrections":[],"better":"Saya ingin kopi, tolong.","tip":"In Malaysia, ‘tolong’ is polite."})
+        else:
+            data.update({"ai_reply":"Bonjour, que souhaitez-vous ?","corrections":[],"better":"Je voudrais un café, s’il vous plaît.","tip":"In France, greet and say please."})
+
+    return {
+        "statusCode": 200,
+        "headers": cors(),
+        "body": json.dumps({
+            "lang": data.get("lang",""),
+            "ai_reply": data.get("ai_reply",""),
+            "corrections": data.get("corrections",[]),
+            "better": data.get("better",""),
+            "tip": data.get("tip","")
+        })
+    }
+
+def cors():
+    return {
+      "Content-Type":"application/json",
+      "Access-Control-Allow-Origin":"*",
+      "Access-Control-Allow-Headers":"Content-Type",
+      "Access-Control-Allow-Methods":"POST,OPTIONS"
+    }
