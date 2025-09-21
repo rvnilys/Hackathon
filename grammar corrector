@@ -1,0 +1,77 @@
+import os, json, boto3
+
+REGION   = os.getenv("AWS_REGION", "us-east-1")
+MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0")
+bedrock  = boto3.client("bedrock-runtime", region_name=REGION)
+
+SYSTEM = (
+    "You are a friendly ESL tutor for CEFR A1–B1 learners.\n"
+    "Return ONLY one JSON object with keys:\n"
+    '{"corrected":"...", "score":0-100, "mistakes":["..."], "why":"...", "suggestions":["..."]}\n'
+    "Keep it short; if the input is already good, score ≥90. No extra text."
+)
+
+def cors():
+    return {
+        "Content-Type":"application/json",
+        "Access-Control-Allow-Origin":"*",
+        "Access-Control-Allow-Headers":"Content-Type",
+        "Access-Control-Allow-Methods":"POST,OPTIONS"
+    }
+
+def parse_json_loose(s: str):
+    s = (s or "").strip()
+    try: return json.loads(s)
+    except: pass
+    start = s.find("{")
+    if start == -1: return None
+    stack = 0
+    for i,ch in enumerate(s[start:], start=start):
+        if ch == "{": stack += 1
+        elif ch == "}":
+            stack -= 1
+            if stack == 0:
+                try: return json.loads(s[start:i+1])
+                except: break
+    end = s.rfind("}")
+    if end > start:
+        try: return json.loads(s[start:end+1])
+        except: return None
+    return None
+
+def call_llm(prompt: str, temperature=0.2, max_gen_len=220):
+    body = {"prompt": prompt, "temperature": temperature, "max_gen_len": max_gen_len}
+    r = bedrock.invoke_model(modelId=MODEL_ID, contentType="application/json",
+                             accept="application/json", body=json.dumps(body))
+    d = json.loads(r["body"].read())
+    return d.get("generation") or (d.get("outputs", [{}])[0].get("text",""))
+
+def lambda_handler(event, context):
+    if event.get("httpMethod") == "OPTIONS":
+        return {"statusCode":200, "headers":cors(), "body":"{}"}
+
+    # Parse body
+    body = {}
+    raw = event.get("body")
+    if isinstance(raw, str):
+        try: body = json.loads(raw)
+        except: body = {}
+    elif isinstance(raw, dict):
+        body = raw
+
+    sentence = (body.get("sentence") or "").strip()
+    if not sentence:
+        return {"statusCode":400, "headers":cors(), "body":json.dumps({"error":"sentence is required"})}
+
+    prompt = f"{SYSTEM}\nInput: \"{sentence}\"\nReturn JSON only."
+    raw_out = call_llm(prompt).strip()
+    data = parse_json_loose(raw_out)
+
+    if not data:
+        raw_out = call_llm(prompt + "\nSTRICT: Output ONLY the JSON object.", temperature=0.1, max_gen_len=200).strip()
+        data = parse_json_loose(raw_out)
+
+    if not data:
+        data = {"corrected": sentence, "score": 60, "mistakes": [], "why": "fallback parse", "suggestions": []}
+
+    return {"statusCode":200, "headers":cors(), "body":json.dumps(data)}
